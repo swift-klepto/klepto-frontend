@@ -1,0 +1,551 @@
+#!/usr/bin/env python3
+
+"""
+ This source file is part of the Swift.org open source project
+
+ Copyright (c) 2014 - 2021 Apple Inc. and the Swift project authors
+ Licensed under Apache License v2.0 with Runtime Library Exception
+
+ See http://swift.org/LICENSE.txt for license information
+ See http://swift.org/CONTRIBUTORS.txt for Swift project authors
+
+ -------------------------------------------------------------------------
+"""
+import json
+import re
+import sys
+from argparse import REMAINDER, ArgumentParser, Namespace
+from enum import Enum
+from os import chmod, getcwd, getenv, stat, symlink
+from pathlib import Path
+from shutil import which
+from subprocess import DEVNULL, PIPE, STDOUT, CompletedProcess
+from subprocess import check_output as check_subprocess_output
+from subprocess import run as run_subprocess
+from sys import stderr
+from tempfile import NamedTemporaryFile
+
+
+# Data classes
+class Configuration(Enum):
+    DEBUG = "debug"
+    RELEASE = "release"
+
+
+# Util functions
+def _run_command(
+    command: list, verbose: bool, *args, cwd=None, **kwargs
+) -> CompletedProcess:
+    if verbose:
+        print(" ".join(command))
+
+    return run_subprocess(command, *args, cwd=cwd, **kwargs)
+
+
+def _fail(message: str):
+    print(f"error: {message}", file=stderr)
+    exit(1)
+
+
+def _get_host_swift_libdirs(verbose: bool) -> list:
+    target_info = _run_command(
+        ["swift", "-print-target-info"],
+        stdout=PIPE,
+        stderr=STDOUT,
+        verbose=verbose,
+    )
+    target_info = json.loads(target_info.stdout)
+
+    return target_info["paths"]["runtimeLibraryPaths"]
+
+
+def _run_swift_command(command: list, verbose: bool) -> CompletedProcess:
+    # # XXX: write a temp bash file and run it as a shell script - the subprocess.run()
+    # # function of python does not work properly: it fails to capture stdout / stderr properly
+    # # and the toolchain does not work for some reason when going through suprocess.run()
+
+    ld_library_path = _get_host_swift_libdirs(verbose)
+
+    # Find what shell to use
+    shell = getenv("SHELL") or "bash"
+    if not which(shell):
+        _fail(f"could not find {shell}")
+
+    klepto_path = _get_klepto_path()
+
+    # Write temp shell script, chmod and run it using shell
+    with NamedTemporaryFile("w", prefix="klepto.", suffix=".sh", delete=False) as tp:
+        tp.write(  # f-string cannot have backslashes so don't use one
+            (f"LD_LIBRARY_PATH={':'.join(ld_library_path)}" if ld_library_path else "")
+            + " "
+            + f"KLEPTO={str(klepto_path.absolute())}"
+            + " "
+            + " \\\n".join(command)
+        )
+
+        tp.flush()
+
+        mode = stat(tp.name).st_mode
+        mode |= (mode & 0o444) >> 2
+        chmod(tp.name, mode)
+
+        # do our own verbose to show the actual call instead of the shell call
+        if verbose:
+            print(" ".join(command))
+
+        return _run_command([shell, tp.name], verbose=False)
+
+
+def _get_klepto_path() -> Path:
+    # __file__ resolves to klepto symlink, NOT klepto-frontend/klepto-frontend
+    return Path(__file__).parent
+
+
+def _get_swiftpm_path(klepto_path: Path) -> Path:
+    return klepto_path / "swiftpm"
+
+
+def _get_devkitpro_path() -> Path:
+    devkitpro_path = getenv("DEVKITPRO")
+    if not devkitpro_path:
+        _fail("DEVKITPRO environment variable is not set, cannot continue")
+
+    devkitpro_path = Path(devkitpro_path)
+    if not devkitpro_path.exists():
+        _fail(
+            f"directory {devkitpro_path.absolute()} was not found, please check the DEVKITPRO environment variable"
+        )
+
+    return devkitpro_path
+
+
+def _run_package(args: list):
+    # Get path to everything
+    klepto_path = _get_klepto_path()
+    swiftpm_path = _get_swiftpm_path(klepto_path)
+
+    swift_package_path = swiftpm_path / "bin" / "swift-package"
+
+    # Check that everything exists
+    for path in [
+        klepto_path,
+        swiftpm_path,
+        swift_package_path,
+    ]:
+        if not path.exists():
+            _fail(f"{str(path.absolute())} does not exist")
+
+    # Run swift-package
+    _run_swift_command(
+        [str(swift_package_path.absolute())] + args,
+        verbose=False,
+    )
+
+
+def _build(args: Namespace, command: str) -> CompletedProcess:
+    verbose = args.verbose
+    jobs = args.jobs
+    configuration = args.configuration
+
+    # Get klepto paths
+    # __file__ resolves to klepto symlink, NOT klepto-frontend/klepto-frontend
+    frontend_path = Path(__file__).parent / "klepto-frontend"
+    klepto_path = _get_klepto_path()
+    toolchain_path = klepto_path / "toolchain"
+    icu_path = klepto_path / "icu"
+    swiftpm_path = _get_swiftpm_path(klepto_path)
+
+    specs_path = frontend_path / "klepto.specs"
+    llvm_bin_path = toolchain_path / "usr" / "bin"
+    icu_paths = [icu_path / "lib", icu_path / "stubdata"]
+    command_path = swiftpm_path / "bin" / command
+
+    # Get devkitPro path
+    devkitpro_path = _get_devkitpro_path()
+
+    if str(devkitpro_path.absolute()) != "/opt/devkitpro":
+        _fail(
+            "due to a clang modulemap format limitation, DEVKITPRO environment "
+            "variable must be set to /opt/devkitpro (path to libnx is hardcoded "
+            "into the toolchain at compilation time)"
+        )
+
+    gcc_path = devkitpro_path / "devkitA64" / "bin" / "aarch64-none-elf-gcc"
+    gpp_path = devkitpro_path / "devkitA64" / "bin" / "aarch64-none-elf-g++"
+
+    # Check that everything exists
+    for path in [
+        frontend_path,
+        klepto_path,
+        toolchain_path,
+        icu_path,
+        swiftpm_path,
+        specs_path,
+        llvm_bin_path,
+        *icu_paths,
+        command_path,
+        gcc_path,
+        gpp_path,
+    ]:
+        if not path.exists():
+            _fail(f"{str(path.absolute())} does not exist")
+
+    # Run devkitA64 gcc for isystem paths
+    gcc_process = _run_command(
+        [str(gcc_path.absolute()), "-xc++", "-E", "-Wp,-v", "-"],
+        stdin=DEVNULL,
+        stdout=PIPE,
+        stderr=STDOUT,
+        verbose=verbose,
+    )
+    include_paths = [
+        f"/{path}"  # regex eats first / so put it back in
+        for path in re.findall(
+            r"^\s+\/(.*?)$", gcc_process.stdout.decode(), flags=re.MULTILINE
+        )
+    ] + [devkitpro_path / "libnx" / "include"]
+
+    # Make a link from aarch64-none-elf-gcc to aarch64-none-unknown-elf-gcc
+    # And do the same for g++
+    gcc_unknown_path = (
+        devkitpro_path / "devkitA64" / "bin" / "aarch64-none-unknown-elf-gcc"
+    )
+    if not gcc_unknown_path.exists():
+        try:
+            symlink(gcc_path, gcc_unknown_path)
+        except PermissionError:
+            _fail(
+                f"couldn't create {str(gcc_unknown_path.absolute())}: permission denied. "
+                f"please make {str(devkitpro_path.absolute())} writable for klepto"
+            )
+
+    gpp_unknown_path = (
+        devkitpro_path / "devkitA64" / "bin" / "aarch64-none-unknown-elf-g++"
+    )
+    if not gpp_unknown_path.exists():
+        try:
+            symlink(gpp_path, gpp_unknown_path)
+        except PermissionError:
+            _fail(
+                f"couldn't create {str(gpp_unknown_path.absolute())}: permission denied. "
+                f"please make {str(devkitpro_path.absolute())} writable for klepto"
+            )
+    # Run swift-build
+    command = [
+        str(command_path.absolute()),
+        "--klepto",
+        "--static-swift-stdlib",
+        f'--klepto-toolchain-path="{str(toolchain_path.absolute())}"',
+        f'--devkitpro-path="{str(devkitpro_path.absolute())}"',
+        f'--klepto-specs-path="{str(specs_path.absolute())}"',
+        f'--klepto-llvm-bin-path="{str(llvm_bin_path.absolute())}"',
+        *[f'--klepto-isystem="{isystem}"' for isystem in include_paths],
+        *[f'--klepto-icu-path="{str(icu_path.absolute())}"' for icu_path in icu_paths],
+        "--build-path",
+        ".build_nx",
+    ]
+
+    if args.verbose:
+        command += ["-v"]
+
+    if args.jobs:
+        command += ["-j", str(jobs)]
+
+    if args.configuration:
+        command += ["-c", configuration]
+
+    if args.xcc:
+        for xcc in args.xcc:
+            command += ["-Xcc", xcc]
+
+    if args.xlinker:
+        for xlinker in args.xlinker:
+            command += ["-Xlinker", xlinker]
+
+    if args.xswiftc:
+        for xswiftc in args.xswiftc:
+            command += ["-Xswiftc", xswiftc]
+
+    return _run_swift_command(command, verbose)
+
+
+# Commands
+def build(args: Namespace):
+    _build(args, "swift-build")
+
+
+def clean(_: Namespace):
+    _run_package(["clean"])
+
+
+def package(_: Namespace):
+    # Manually rebuild args since ArgumentParser does not allow reading
+    # args in an ordered-list as entered by the user
+    args = sys.argv[2:]  # remove "klepto" and "package"
+
+    _run_package(args)
+
+
+def run(args: Namespace):
+    # XXX: don't use swift-run since it doesn't seem to build nxApplications correctly
+    # (klepto link arguments are not added, it tries to build test products...)
+    # and I'm bored to find out why -> it's faster to just call build + nxlink here
+
+    # Get path to nxlink
+    devkitpro_path = _get_devkitpro_path()
+    nxlink_path = devkitpro_path / "tools" / "bin" / "nxlink"
+
+    # Check that everything exists
+    for path in [
+        devkitpro_path,
+        nxlink_path,
+    ]:
+        if not path.exists():
+            _fail(f"{str(path.absolute())} does not exist")
+
+    # Build the project
+    # TODO: allow having multiple products and selecting the one to build and run
+    build_process = _build(args, "swift-build")
+
+    if build_process.returncode != 0:
+        return
+
+    # List all NROs in currenty directory
+    products = []
+    current_directory = Path(getcwd())
+    for file in current_directory.iterdir():
+        if file.name.endswith(".nro"):
+            products.append(file)
+
+    if not products:
+        _fail("did not find any nxApplication product to run")
+
+    if len(products) > 1:
+        _fail("product selection unimplemented")
+
+    # Select product to run
+    product_to_run = products[0]
+
+    # Build command
+    command = [str(nxlink_path.absolute())]
+
+    if args.address:
+        command += ["-a", args.address]
+
+    if args.retries:
+        command += ["-r", str(args.retries)]
+
+    if args.path:
+        command += ["-p", args.path]
+
+    if args.server:
+        command += ["-s"]
+
+    if args.args:
+        command += ["--args", args.args]
+
+    command.append(str(product_to_run.absolute()))
+
+    # Run it
+    try:
+        _run_command(
+            command,
+            verbose=args.verbose,
+        )
+    except KeyboardInterrupt:
+        # nxlink server will not exit if stdio redirection isn't
+        # setup on the homebrew side, and the only way to exit is by using
+        # Ctrl-C so don't bother flooding the terminal with a KeyboardInterrupt
+        # crash because it will happen a lot
+        pass
+
+
+# Add arguments
+def add_build_args(parser: ArgumentParser):
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="increase verbosity of informational output",
+        dest="verbose",
+    )
+
+    parser.add_argument(
+        "-j",
+        "--jobs",
+        action="store",
+        type=int,
+        help="the number of jobs to spawn in parallel during the build process",
+        dest="jobs",
+    )
+
+    parser.add_argument(
+        "-c",
+        "--configuration",
+        action="store",
+        type=str,
+        help="build with configuration (default: debug)",
+        dest="configuration",
+        default=Configuration.DEBUG.value,
+        choices=[conf.value for conf in Configuration],
+    )
+
+    parser.add_argument(
+        "-Xcc",
+        action="append",
+        type=str,
+        help="pass flag through to all C compiler invocations",
+        dest="xcc",
+        default=None,
+    )
+
+    parser.add_argument(
+        "-Xlinker",
+        action="append",
+        type=str,
+        help="pass flag through to all linker invocations",
+        dest="xlinker",
+        default=None,
+    )
+
+    parser.add_argument(
+        "-Xswiftc",
+        action="append",
+        type=str,
+        help="pass flag through to all Swift compiler invocations",
+        dest="xswiftc",
+        default=None,
+    )
+
+
+def add_package_args(parser: ArgumentParser):
+    # Package command is just a forwarder to swift-package so accept everything
+    # and pass arguments blindly
+    parser.add_argument(
+        "args",
+        help="forwarded arguments to swift-package, use 'swift package --help' to see your options",
+        nargs=REMAINDER,
+    )
+
+
+def add_run_args(parser: ArgumentParser):
+    add_build_args(parser)
+
+    # TODO: product name? add it to build instead
+
+    parser.add_argument(
+        "--address",
+        "-a",
+        action="store",
+        type=str,
+        help="hostname or IPv4 address of Switch",
+    )
+
+    parser.add_argument(
+        "--retries",
+        "-r",
+        action="store",
+        type=int,
+        help="number of times to ping before giving up",
+    )
+
+    parser.add_argument(
+        "--path", "-p", action="store", type=str, help="set upload path for file"
+    )
+
+    parser.add_argument(
+        "--args", action="store", type=str, help="args to send to nro", dest="args"
+    )
+
+    parser.add_argument(
+        "--server",
+        "-s",
+        action="store_true",
+        help="start server after completed upload",
+    )
+
+
+parser = ArgumentParser(description="Nintendo Switch homebrew Swift toolchain frontend")
+
+subparsers = parser.add_subparsers(dest="command", required=True)
+
+# build
+parser_build = subparsers.add_parser("build", help="build sources into binary products")
+parser_build.set_defaults(func=build)
+add_build_args(parser_build)
+
+# clean
+parser_clean = subparsers.add_parser(
+    "clean", help="delete build artifacts (shortcut to 'klepto package clean')"
+)
+parser_clean.set_defaults(func=clean)
+
+# package
+parser_package = subparsers.add_parser(
+    "package", help="perform operations on Swift packages"
+)
+parser_package.set_defaults(func=package)
+add_package_args(parser_package)
+
+# run
+parser_run = subparsers.add_parser(
+    "run", help="build and run an executable product using nxlink"
+)
+parser_run.set_defaults(func=run)
+add_run_args(parser_run)
+
+# Required software check
+required_software = ["swift"]
+for software in required_software:
+    if not which(software):
+        _fail(f"could not find {software}")
+
+# Ensure the host Swift version is the same as the toolchain's
+swift_version_output = _run_command(
+    ["swift", "--version"], verbose=False, stdout=PIPE
+).stdout.decode()
+host_swift_version = re.findall(r"^Swift version ([0-9\.]+)", swift_version_output)[0]
+
+with open(
+    Path(__file__).parent / "manifest.json", "r"  # __file__ points to klepto symlink
+) as manifest:
+    manifest_json = json.loads(manifest.read())
+    manifest_versions = manifest_json["versions"]
+    toolchain_swift_version = manifest_versions["swift"]
+
+if toolchain_swift_version != host_swift_version:
+    _fail(
+        f"host Swift version {host_swift_version} does not match klepto "
+        f"toolchain version {toolchain_swift_version}"
+    )
+
+# Get devkitA64 and libnx versions from (dkp-)pacman
+using = "dkp-pacman"
+try:
+    query = _run_command(["dkp-pacman", "-Qe"], stdout=PIPE, verbose=False)
+except FileNotFoundError:
+    try:
+        using = "pacman"
+        query = check_subprocess_output(["pacman", "-Qe"])
+    except FileNotFoundError:
+        _fail(
+            "could not find dkp-pacman or pacman to determine installed "
+            "devkitA64 and libnx versions"
+        )
+
+# entry format: "{package name} {version}"
+# entries are newline separated
+entries = query.stdout.decode().strip().split("\n")
+versions = dict(entry.split(" ") for entry in entries)
+
+for pacman_package in ["libnx", "devkitA64"]:
+    if versions[pacman_package] != manifest_versions[pacman_package]:
+        _fail(
+            f"installed package {pacman_package} version {versions[pacman_package]} "
+            f"does not match the one klepto has been built with: {manifest_versions[pacman_package]}"
+        )
+
+# Run requested command
+args = parser.parse_args()
+args.func = args.func or build
+args.func(args)
